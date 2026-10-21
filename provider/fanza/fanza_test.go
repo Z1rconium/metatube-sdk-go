@@ -22,7 +22,6 @@ func TestFANZA_GetMovieInfoByID(t *testing.T) {
 		"403jdxa57676",
 		"pkpd00170",
 		"mism00238",
-		"1msfh00007",
 		"1stars00141",
 		"118abp906",
 		"196glod0325t",

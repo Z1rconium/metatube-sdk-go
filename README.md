@@ -83,8 +83,13 @@ still region-restricted, the provider falls back as follows:
 
 1. The request is sent through the proxy.
 2. On failure, a new exit IP is acquired from the gateway and the request is retried once.
-3. If it still fails, the provider falls back to direct server egress, and probes the
-   proxy again after a cooldown.
+   - If the gateway is already switching nodes by itself (e.g. after the tunnel died), the
+     provider waits for it to settle instead of sending a competing switch request.
+   - Concurrent failures of the same exit IP are coalesced into a single switch.
+   - If the best node cannot be connected, the next best nodes are tried.
+3. If it still fails, the provider falls back to direct server egress for one minute, and
+   then resumes the proxy on the next request. If the proxy is still unusable, it falls
+   back again.
 
 ### Deployment notes
 

@@ -120,7 +120,7 @@ func (fz *FANZA) SetProxy(proxyURL string) error {
 		return err
 	}
 	fz.proxy = m
-	fz.Scraper.SetProxyFunc(m.ProxyFunc)
+	fz.Scraper.SetTransport(m.Transport())
 	// The GraphQL API client ignores the response status, so wrap the
 	// transport to surface the gateway errors of a dead VPN tunnel.
 	fz.httpClient.Transport = proxy.CheckStatus(m.Transport())

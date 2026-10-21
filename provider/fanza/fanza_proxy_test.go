@@ -130,4 +130,7 @@ func TestFANZA_SetConfig(t *testing.T) {
 	require.NotNil(t, fz.proxy)
 	assert.Equal(t, "http://127.0.0.1:7928", fz.proxy.Endpoint())
 	assert.Equal(t, "JP", fz.proxy.Country())
+	// The scraper shares the transport of the proxy manager, so that a switch
+	// closes the idle connections of both the scraper and the API client.
+	assert.Same(t, fz.proxy.Transport(), fz.Scraper.Transport())
 }

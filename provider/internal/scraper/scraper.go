@@ -20,11 +20,12 @@ var (
 
 // Scraper implements the basic Provider interface.
 type Scraper struct {
-	name     string
-	baseURL  *url.URL
-	priority *atomic.Float64
-	language language.Tag
-	c        *colly.Collector
+	name      string
+	baseURL   *url.URL
+	priority  *atomic.Float64
+	language  language.Tag
+	c         *colly.Collector
+	transport http.RoundTripper
 }
 
 // NewScraper returns a *Scraper that implements provider.Provider.
@@ -94,6 +95,10 @@ func (s *Scraper) SetProxy(proxyURL string) error {
 // Unlike SetProxy, the given function is invoked for every request, which
 // makes it possible to switch the proxy at runtime, e.g. to rotate the exit
 // IP of a VPN gateway or to fall back to direct server egress.
+//
+// Note that the transport resolves the proxy per connection, so the keep
+// alive connections are disabled to make a switch take effect immediately.
+// Prefer SetTransport if the transport itself manages the switching.
 func (s *Scraper) SetProxyFunc(f func(*http.Request) (*url.URL, error)) {
 	transport := &http.Transport{Proxy: f, DisableKeepAlives: true}
 	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
@@ -101,7 +106,28 @@ func (s *Scraper) SetProxyFunc(f func(*http.Request) (*url.URL, error)) {
 		transport.Proxy = f
 		transport.DisableKeepAlives = true
 	}
+	s.SetTransport(transport)
+}
+
+// SetTransport sets the transport for HTTP requests, e.g. one that is shared
+// with a runtime-switchable proxy manager, so that switching the proxy closes
+// the idle connections of the scraper as well.
+//
+// The idle connections of the previous transport, if it has any, are closed.
+func (s *Scraper) SetTransport(transport http.RoundTripper) {
+	s.closeIdleConnections()
+	s.transport = transport
 	s.c.WithTransport(transport)
+}
+
+// Transport returns the transport in use, or nil if the default one is used.
+func (s *Scraper) Transport() http.RoundTripper { return s.transport }
+
+// closeIdleConnections closes the idle connections of the current transport.
+func (s *Scraper) closeIdleConnections() {
+	if t, ok := s.transport.(interface{ CloseIdleConnections() }); ok {
+		t.CloseIdleConnections()
+	}
 }
 
 // SetRequestTimeout sets timeout for HTTP requests.

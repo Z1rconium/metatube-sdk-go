@@ -876,9 +876,11 @@ func (fz *FANZA) getMovieReviewsByID(id string) (reviews []*model.MovieReviewDet
 // fetchWithExitFallback performs the given fetch function and, when the
 // current exit IP turns out to be unusable, e.g. the VPN tunnel is down or
 // the page is still region-restricted, it tries to acquire a new exit IP once
-// before falling back to direct server egress.
+// before falling back to the default server egress, i.e. the proxy configured
+// by the user for the server, if any, or direct egress.
 //
-// It is a no-op if no proxy is configured for the provider.
+// It is a no-op unless a VPN gateway is configured for the provider. A proxy
+// that the user configured by hand is used as is and is never bypassed.
 func (fz *FANZA) fetchWithExitFallback(fetch func() error) error {
 	var generation uint64
 	if fz.proxy != nil {
@@ -890,8 +892,8 @@ func (fz *FANZA) fetchWithExitFallback(fetch func() error) error {
 	if err == nil || !fz.isExitUnusable(err) {
 		return err
 	}
-	if fz.proxy == nil {
-		return err // no proxy configured, nothing to fall back from.
+	if fz.proxy == nil || !fz.proxy.HasGateway() {
+		return err // the proxy, if any, is managed by the user, not by us.
 	}
 	// The current exit IP is unusable, try to acquire a new one.
 	if fz.proxy.CanRotate() {
@@ -905,8 +907,8 @@ func (fz *FANZA) fetchWithExitFallback(fetch func() error) error {
 			}
 		}
 	}
-	// The exit IP is still unusable, fall back to direct server egress.
-	log.Printf("[FANZA] falling back to direct server egress")
+	// The exit IP is still unusable, fall back to the default server egress.
+	log.Printf("[FANZA] falling back to the default server egress")
 	fz.proxy.Fallback()
 	return fetch()
 }

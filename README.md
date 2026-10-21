@@ -87,9 +87,10 @@ still region-restricted, the provider falls back as follows:
      provider waits for it to settle instead of sending a competing switch request.
    - Concurrent failures of the same exit IP are coalesced into a single switch.
    - If the best node cannot be connected, the next best nodes are tried.
-3. If it still fails, the provider falls back to direct server egress for one minute, and
-   then resumes the proxy on the next request. If the proxy is still unusable, it falls
-   back again.
+3. If it still fails, the provider falls back to the default server egress for one minute,
+   and then resumes the gateway proxy on the next request. If it is still unusable, it falls
+   back again. The default server egress is the proxy that you have configured for the
+   server, e.g. `HTTP_PROXY` / `HTTPS_PROXY`, or direct egress if there is none.
 
 ### Deployment notes
 
@@ -100,8 +101,12 @@ still region-restricted, the provider falls back as follows:
 - The gateway must be configured with the target country, e.g. the routing mode
   `fixed_region` with `force_country` set to `JP`, otherwise the exit IP may not be
   located in the requested region.
-- Only the providers that are configured with a proxy are affected, all the other
-  providers keep using direct server egress.
+- The gateway only takes over the providers that are configured with `vpngate_url`, i.e. the
+  region-restricted ones such as `FANZA`. All the other providers keep using whatever you
+  have configured for them, i.e. their own `proxy` config, or `HTTP_PROXY` / `HTTPS_PROXY`,
+  or direct egress.
+- A plain `proxy` config without `vpngate_url` is used as is: the provider never bypasses
+  it nor falls back to direct egress.
 
 ## Credits
 

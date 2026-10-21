@@ -51,7 +51,7 @@ func TestFANZA_fetchWithExitFallback(t *testing.T) {
 	})
 
 	t.Run("ProxyWithoutGateway", func(t *testing.T) {
-		// The exit IP cannot be rotated, fall back to direct egress at once.
+		// A proxy that the user configured by hand is used as is.
 		fz := New()
 		require.NoError(t, fz.SetProxy("http://127.0.0.1:7928"))
 		var calls int
@@ -60,8 +60,8 @@ func TestFANZA_fetchWithExitFallback(t *testing.T) {
 			return ErrRegionNotAvailable
 		})
 		require.ErrorIs(t, err, ErrRegionNotAvailable)
-		assert.Equal(t, 2, calls)
-		assert.True(t, fz.proxy.InFallback())
+		assert.Equal(t, 1, calls)
+		assert.False(t, fz.proxy.InFallback())
 	})
 
 	t.Run("RotateExitIP", func(t *testing.T) {

@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,19 @@ var ErrUnauthorized = errors.New("vpngate: unauthorized")
 // ErrSwitching is returned when the gateway rejects a request because it is
 // switching nodes by itself. The request may be retried once it has settled.
 var ErrSwitching = errors.New("vpngate: gateway is switching nodes")
+
+// userInfoPattern matches the user info of a URL, e.g. the credentials of
+// "http://user:secret@host", including the malformed URLs that do not parse.
+var userInfoPattern = regexp.MustCompile(`//[^/@\s]*@`)
+
+// RedactURL returns the given URL with its user info, if any, redacted, so
+// that it is safe to include in an error message or a log entry.
+func RedactURL(rawURL string) string {
+	if u, err := url.Parse(strings.TrimSpace(rawURL)); err == nil && u.User != nil {
+		return u.Redacted()
+	}
+	return userInfoPattern.ReplaceAllString(rawURL, "//***@")
+}
 
 // Config is the configuration of the gateway management API client.
 type Config struct {
@@ -119,10 +133,11 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("vpngate: invalid url %q: %w", rawURL, err)
+		// The parse error may quote the raw url, credentials included.
+		return nil, fmt.Errorf("vpngate: invalid url %q", RedactURL(rawURL))
 	}
 	if u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("vpngate: invalid url %q", rawURL)
+		return nil, fmt.Errorf("vpngate: invalid url %q", RedactURL(rawURL))
 	}
 	username, password := cfg.Username, cfg.Password
 	if u.User != nil {

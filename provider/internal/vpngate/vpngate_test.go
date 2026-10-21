@@ -70,11 +70,26 @@ func TestClient_Auth(t *testing.T) {
 	_, err := NewClient(Config{URL: srv.URL + "/secret"})
 	assert.Error(t, err)
 
+	// A malformed url must not leak the credentials in the error.
+	_, err = NewClient(Config{URL: "://admin:secret@127.0.0.1", Username: "admin", Password: "secret"})
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "secret")
+
 	// Wrong credentials.
 	client, err := NewClient(Config{URL: srv.URL + "/secret", Username: "admin", Password: "wrong"})
 	require.NoError(t, err)
 	_, _, err = client.Nodes(context.Background())
 	assert.ErrorIs(t, err, ErrUnauthorized)
+}
+
+func TestRedactURL(t *testing.T) {
+	assert.Equal(t,
+		"http://user:xxxxx@127.0.0.1:8787/secret",
+		RedactURL("http://user:secret@127.0.0.1:8787/secret"))
+	assert.Equal(t,
+		"http://127.0.0.1:8787/secret",
+		RedactURL("http://127.0.0.1:8787/secret"))
+	assert.NotContains(t, RedactURL("://admin:secret@127.0.0.1"), "secret")
 }
 
 func TestClient_Nodes(t *testing.T) {

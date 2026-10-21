@@ -373,6 +373,10 @@ func TestIsTransportError(t *testing.T) {
 	var netErr net.Error = &net.DNSError{Err: "timeout", IsTimeout: true}
 	assert.True(t, IsTransportError(netErr))
 
+	// A nonexistent host is a content problem, not a dead tunnel.
+	assert.False(t, IsTransportError(&net.DNSError{Err: "no such host", IsNotFound: true}))
+	assert.False(t, IsTransportError(errors.New("dial tcp: lookup foo.invalid: no such host")))
+
 	assert.False(t, IsTransportError(errors.New("not found")))
 }
 

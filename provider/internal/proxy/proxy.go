@@ -140,10 +140,11 @@ func New(rawURL string) (*Manager, error) {
 	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("proxy: invalid url %q: %w", rawURL, err)
+		// The parse error may quote the raw url, credentials included.
+		return nil, fmt.Errorf("proxy: invalid url %q", vpngate.RedactURL(rawURL))
 	}
 	if u.Scheme == "" || u.Host == "" {
-		return nil, fmt.Errorf("proxy: invalid url %q", rawURL)
+		return nil, fmt.Errorf("proxy: invalid url %q", vpngate.RedactURL(rawURL))
 	}
 	switch u.Scheme {
 	case "http", "https", "socks5", "socks5h":
@@ -500,7 +501,10 @@ func IsTransportError(err error) bool {
 	}
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
-		return true
+		// A host that does not exist is a content problem, not a dead
+		// tunnel, so it must not rotate the exit IP. Any other resolver
+		// failure indicates that the exit cannot reach the network.
+		return !dnsErr.IsNotFound
 	}
 	var addrErr *net.AddrError
 	if errors.As(err, &addrErr) {
@@ -520,15 +524,13 @@ func IsTransportError(err error) bool {
 		return true
 	}
 	// The VPN gateway responds with a gateway error when the underlying VPN
-	// tunnel is down, e.g. "Bad Gateway".
+	// tunnel is down, e.g. "Bad Gateway". The connection errors are typed, so
+	// they do not have to be matched by their message.
 	msg := err.Error()
 	for _, s := range []string{
 		"Bad Gateway",
 		"Service Unavailable",
 		"Gateway Timeout",
-		"connection refused",
-		"connection reset",
-		"no such host",
 	} {
 		if strings.Contains(msg, s) {
 			return true

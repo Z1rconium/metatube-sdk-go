@@ -86,6 +86,7 @@ still region-restricted, the provider falls back as follows:
    - If the gateway is already switching nodes by itself (e.g. after the tunnel died), the
      provider waits for it to settle instead of sending a competing switch request.
    - Concurrent failures of the same exit IP are coalesced into a single switch.
+     Failed rotations share the same error during the one-minute cooldown before retrying.
    - If the best node cannot be connected, the next best nodes are tried.
    - The whole rotation is bounded to two minutes, so that a gateway that stops answering
      cannot block the provider for longer than that.

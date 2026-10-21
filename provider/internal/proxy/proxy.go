@@ -129,6 +129,11 @@ type Manager struct {
 	// have failed with the same exit IP rotate it only once.
 	gen       atomic.Uint64
 	rotateSem chan struct{}
+
+	// Failed rotations are shared until the cooldown expires, without
+	// advancing the exit generation. Protected by rotateSem.
+	rotateErr      error
+	rotateFailedAt time.Time
 }
 
 // New returns a proxy manager for the given proxy endpoint, which may be an
@@ -297,7 +302,8 @@ func (m *Manager) Rotate(ctx context.Context) error {
 // which case it returns immediately and the caller should simply retry.
 //
 // Rotations are serialized, so a burst of failed requests switches the
-// gateway only once instead of flooding it with switch requests. The whole
+// gateway only once instead of flooding it with switch requests. A failed
+// rotation's error is shared until the cooldown expires. The whole
 // rotation, including the time spent queuing behind another one, is bounded
 // by DefaultRotateTimeout, so that a stalled gateway cannot block the
 // provider for minutes.
@@ -317,12 +323,23 @@ func (m *Manager) RotateFrom(ctx context.Context, gen uint64) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if m.gen.Load() != gen {
 		return nil // another caller has just acquired a new exit IP.
 	}
+	if m.rotateErr != nil && (time.Since(m.rotateFailedAt) < m.cooldownDuration() || !m.CanRotate()) {
+		return m.rotateErr // reuse a failed rotation, including while falling back.
+	}
 	if err := m.rotate(ctx, gateway, country); err != nil {
+		if !errors.Is(err, context.Canceled) {
+			m.rotateErr = err
+			m.rotateFailedAt = time.Now()
+		}
 		return err
 	}
+	m.rotateErr = nil
 	// The exit IP has been switched, resume the proxy if it was falling back.
 	m.gen.Add(1)
 	// The pooled connections still point at the exit IP that the gateway has
@@ -507,16 +524,16 @@ func IsTransportError(err error) bool {
 			return true
 		}
 	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
-		return true
-	}
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
 		// A host that does not exist is a content problem, not a dead
 		// tunnel, so it must not rotate the exit IP. Any other resolver
 		// failure indicates that the exit cannot reach the network.
 		return !dnsErr.IsNotFound
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
 	}
 	var addrErr *net.AddrError
 	if errors.As(err, &addrErr) {

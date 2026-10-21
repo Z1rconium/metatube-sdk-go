@@ -101,7 +101,11 @@ func (s *Scraper) SetProxy(proxyURL string) error {
 // Prefer SetTransport if the transport itself manages the switching.
 func (s *Scraper) SetProxyFunc(f func(*http.Request) (*url.URL, error)) {
 	transport := &http.Transport{Proxy: f, DisableKeepAlives: true}
-	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+	base := s.transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if dt, ok := base.(*http.Transport); ok {
 		transport = dt.Clone()
 		transport.Proxy = f
 		transport.DisableKeepAlives = true

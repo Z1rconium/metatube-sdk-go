@@ -303,6 +303,49 @@ func TestCountryMismatch(t *testing.T) {
 	assert.NotEmpty(t, countryMismatch(vpngate.Status{ForceCountry: "US"}, "JP"))
 }
 
+func TestManager_Rotate_ClosesIdleConnections(t *testing.T) {
+	g := newFakeGateway(t, 0, 0)
+	m := newTestManager(t, g)
+
+	// The fake proxy counts the connections it accepts, so that the reuse of
+	// the pooled connections is visible.
+	var conns atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	m.endpoint.Store(u)
+
+	client := &http.Client{Transport: m.Transport()}
+	get := func() {
+		t.Helper()
+		resp, err := client.Get("http://www.dmm.co.jp/")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		_, err = io.Copy(io.Discard, resp.Body)
+		require.NoError(t, err)
+	}
+
+	get()
+	get()
+	// The second request reuses the connection of the first one.
+	require.EqualValues(t, 1, conns.Load())
+
+	// The tunnel of the old exit IP has been torn down by the gateway, so the
+	// pooled connections must be dropped, or the next request hangs on them.
+	require.NoError(t, m.Rotate(context.Background()))
+	get()
+	assert.EqualValues(t, 2, conns.Load())
+}
+
 func TestManager_ProxyFunc_FallbackProxy(t *testing.T) {
 	m, err := New("http://127.0.0.1:7928")
 	require.NoError(t, err)

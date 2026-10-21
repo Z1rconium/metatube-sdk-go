@@ -294,6 +294,72 @@ func TestManager_Rotate_Budget(t *testing.T) {
 	assert.EqualValues(t, 0, m.Generation())
 }
 
+func TestManager_Rotate_FailedConcurrent(t *testing.T) {
+	for _, fallback := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Fallback=%t", fallback), func(t *testing.T) {
+			g := newFakeGateway(t, 0, 100)
+			m := newTestManager(t, g)
+			var ready, done sync.WaitGroup
+			start := make(chan struct{})
+			errs := make(chan error, 4)
+			for range 4 {
+				ready.Add(1)
+				done.Add(1)
+				go func() {
+					defer done.Done()
+					// All callers pass CanRotate before any rotation finishes.
+					assert.True(t, m.CanRotate())
+					ready.Done()
+					<-start
+					err := m.RotateFrom(context.Background(), 0)
+					errs <- err
+					if fallback && err != nil {
+						m.Fallback()
+					}
+				}()
+			}
+			ready.Wait()
+			close(start)
+			done.Wait()
+			close(errs)
+			for err := range errs {
+				require.Error(t, err)
+				assert.Same(t, m.rotateErr, err)
+			}
+			assert.EqualValues(t, maxSwitchCandidates, g.connects.Load())
+			assert.EqualValues(t, 0, m.Generation())
+		})
+	}
+}
+
+func TestManager_Rotate_FailedCooldown(t *testing.T) {
+	g := newFakeGateway(t, 0, maxSwitchCandidates)
+	m := newTestManager(t, g)
+	err := m.RotateFrom(context.Background(), 0)
+	require.Error(t, err)
+	assert.Same(t, err, m.RotateFrom(context.Background(), 0))
+	assert.EqualValues(t, maxSwitchCandidates, g.connects.Load())
+
+	// A canceled caller must receive its own cancellation, not the cached error.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.ErrorIs(t, m.RotateFrom(ctx, 0), context.Canceled)
+
+	// Falling back later extends the cooldown; a queued caller must check it.
+	m.rotateFailedAt = time.Now().Add(-2 * DefaultFallbackCooldown)
+	m.Fallback()
+	assert.Same(t, err, m.RotateFrom(context.Background(), 0))
+	assert.EqualValues(t, maxSwitchCandidates, g.connects.Load())
+
+	// Once both cooldowns expire the same exit generation may be tried again.
+	m.fellBack.Store(time.Now().Add(-2 * DefaultFallbackCooldown).UnixNano())
+	require.NoError(t, m.RotateFrom(context.Background(), 0))
+	assert.EqualValues(t, maxSwitchCandidates+1, g.connects.Load())
+	assert.EqualValues(t, 1, m.Generation())
+	assert.Nil(t, m.rotateErr)
+	assert.False(t, m.InFallback())
+}
+
 func TestCountryMismatch(t *testing.T) {
 	assert.Empty(t, countryMismatch(vpngate.Status{}, "JP"))
 	assert.Empty(t, countryMismatch(vpngate.Status{
@@ -419,6 +485,12 @@ func TestIsTransportError(t *testing.T) {
 
 	// A nonexistent host is a content problem, not a dead tunnel.
 	assert.False(t, IsTransportError(&net.DNSError{Err: "no such host", IsNotFound: true}))
+	for _, notFound := range []bool{false, true} {
+		// Real HTTP/Dial errors wrap DNSError in OpError and often url.Error.
+		err := &net.OpError{Op: "dial", Err: &net.DNSError{Err: "lookup failed", IsNotFound: notFound}}
+		assert.Equal(t, !notFound, IsTransportError(err))
+		assert.Equal(t, !notFound, IsTransportError(&url.Error{Op: "Get", URL: "https://example.invalid", Err: err}))
+	}
 	assert.False(t, IsTransportError(errors.New("dial tcp: lookup foo.invalid: no such host")))
 
 	assert.False(t, IsTransportError(errors.New("not found")))

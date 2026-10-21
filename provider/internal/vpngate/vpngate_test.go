@@ -46,12 +46,18 @@ func newTestServer(t *testing.T) *httptest.Server {
 		}
 		var payload map[string]string
 		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
-		if payload["id"] != "JP_5.6.7.8_443_tcp" {
+		switch payload["id"] {
+		case "JP_5.6.7.8_443_tcp":
+			_, _ = w.Write([]byte(`{"ok":true,"message":"Connected JP_5.6.7.8_443_tcp"}`))
+		case "JP_busy_1.1.1.1_443_tcp":
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"ok":false,"error":"switch task is running"}`))
+		case "JP_settling_1.1.1.1_443_tcp":
+			_, _ = w.Write([]byte(`{"ok":false,"error":"switch task is running"}`))
+		default:
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte(`{"ok":false,"error":"目标节点预检失败"}`))
-			return
 		}
-		_, _ = w.Write([]byte(`{"ok":true,"message":"Connected JP_5.6.7.8_443_tcp"}`))
 	})
 	return httptest.NewServer(mux)
 }
@@ -102,4 +108,9 @@ func TestClient_Connect(t *testing.T) {
 	require.NoError(t, client.Connect(context.Background(), "JP_5.6.7.8_443_tcp"))
 	assert.Error(t, client.Connect(context.Background(), ""))
 	assert.Error(t, client.Connect(context.Background(), "JP_unknown"))
+
+	// The gateway is switching nodes by itself, both as a conflict response
+	// and as a rejected switch request with a 200 status.
+	assert.ErrorIs(t, client.Connect(context.Background(), "JP_busy_1.1.1.1_443_tcp"), ErrSwitching)
+	assert.ErrorIs(t, client.Connect(context.Background(), "JP_settling_1.1.1.1_443_tcp"), ErrSwitching)
 }

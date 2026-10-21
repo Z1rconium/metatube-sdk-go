@@ -99,6 +99,9 @@ type fakeGateway struct {
 	// failConnects is the number of the switch requests that fail on
 	// pre-check, before one succeeds.
 	failConnects int32
+	// conflicts is the number of the switch requests that are rejected
+	// because the gateway is switching nodes by itself.
+	conflicts int32
 
 	polls    atomic.Int32
 	connects atomic.Int32
@@ -130,7 +133,10 @@ func newFakeGateway(t *testing.T, connectingPolls, failConnects int32) *fakeGate
 		case g.connecting():
 			w.WriteHeader(http.StatusConflict)
 			_, _ = w.Write([]byte(`{"ok":false,"error":"switch task is running"}`))
-		case n <= g.failConnects:
+		case n <= g.conflicts:
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"ok":false,"error":"switch task is running"}`))
+		case n <= g.conflicts+g.failConnects:
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte(`{"ok":false,"error":"pre-check failed"}`))
 		default:
@@ -199,6 +205,17 @@ func TestManager_Rotate(t *testing.T) {
 		assert.EqualValues(t, 0, m.Generation())
 	})
 
+	t.Run("SwitchConflict", func(t *testing.T) {
+		// The gateway is switching nodes by itself and rejects our request,
+		// so we wait for it to settle instead of trying another node.
+		g := newFakeGateway(t, 0, 0)
+		g.conflicts = 1
+		m := newTestManager(t, g)
+		require.NoError(t, m.Rotate(context.Background()))
+		assert.EqualValues(t, 1, g.connects.Load()) // no next candidate.
+		assert.EqualValues(t, 1, m.Generation())
+	})
+
 	t.Run("StaleGeneration", func(t *testing.T) {
 		// The exit IP has been rotated since the caller observed its failure.
 		g := newFakeGateway(t, 0, 0)
@@ -234,6 +251,55 @@ func TestManager_Rotate(t *testing.T) {
 		cancel()
 		assert.ErrorIs(t, m.Rotate(ctx), context.Canceled)
 	})
+}
+
+func TestManager_Rotate_Budget(t *testing.T) {
+	// A gateway that accepts the connections but never answers must not hold
+	// the rotation (and the semaphore) longer than the budget.
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/secret/api/login":
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/secret/api/nodes":
+			_, _ = w.Write([]byte(`{"nodes":[
+				{"id":"JP_1.1.1.1_443_tcp","country_short":"JP","probe_status":"available","latency_ms":10,"active":false}
+			],"state":{"proxy_ok":true}}`))
+		case "/secret/api/connect":
+			<-release // never answers, until the client gives up.
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+
+	gateway, err := vpngate.NewClient(vpngate.Config{
+		URL: srv.URL + "/secret", Username: "admin", Password: "secret",
+	})
+	require.NoError(t, err)
+	m, err := New("http://127.0.0.1:7928")
+	require.NoError(t, err)
+	m.SetGateway(gateway, "JP")
+	m.recoverPoll = 10 * time.Millisecond
+	m.recoverGrace = 10 * time.Millisecond
+	m.rotateTimeout = 150 * time.Millisecond
+
+	start := time.Now()
+	err = m.Rotate(context.Background())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 2*time.Second)
+	assert.Empty(t, m.rotateSem) // the budget does not leak the semaphore.
+	assert.EqualValues(t, 0, m.Generation())
+}
+
+func TestCountryMismatch(t *testing.T) {
+	assert.Empty(t, countryMismatch(vpngate.Status{}, "JP"))
+	assert.Empty(t, countryMismatch(vpngate.Status{
+		RoutingMode: routingModeFixedRegion, ForceCountry: "JP",
+	}, "jp"))
+	assert.NotEmpty(t, countryMismatch(vpngate.Status{RoutingMode: "auto"}, "JP"))
+	assert.NotEmpty(t, countryMismatch(vpngate.Status{ForceCountry: "US"}, "JP"))
 }
 
 func TestManager_ProxyFunc_FallbackProxy(t *testing.T) {

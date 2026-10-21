@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -38,12 +39,23 @@ const DefaultRecoverTimeout = 90 * time.Second
 // itself and rejects (and penalizes) concurrent switch requests.
 const DefaultRecoverGrace = 4 * time.Second
 
+// DefaultRotateTimeout bounds the whole rotation, i.e. the time spent queuing
+// behind another rotation, observing the gateway, waiting for it to recover
+// and connecting the candidate nodes. Without it, a gateway that accepts the
+// connections but never answers could hold the rotation for ten minutes,
+// blocking every request of the provider behind it.
+const DefaultRotateTimeout = 2 * time.Minute
+
 // recoverPollInterval is the interval of polling the gateway status while
 // waiting for it to recover.
 const recoverPollInterval = 2 * time.Second
 
 // maxSwitchCandidates is the maximum number of nodes to try when switching.
 const maxSwitchCandidates = 3
+
+// routingModeFixedRegion is the gateway routing mode that keeps the exit IP
+// in the force country, which is required for a stable region.
+const routingModeFixedRegion = "fixed_region"
 
 // ErrNoGateway is returned when no VPN gateway is configured.
 var ErrNoGateway = errors.New("proxy: no vpn gateway configured")
@@ -107,6 +119,11 @@ type Manager struct {
 	recoverTimeout time.Duration
 	recoverGrace   time.Duration
 	recoverPoll    time.Duration
+	rotateTimeout  time.Duration
+
+	// warnOnce reports the gateway configuration of a mismatched country
+	// only once, so that it does not flood the log on every rotation.
+	warnOnce sync.Once
 
 	// gen counts the completed rotations, so that concurrent callers that
 	// have failed with the same exit IP rotate it only once.
@@ -139,6 +156,7 @@ func New(rawURL string) (*Manager, error) {
 		recoverTimeout: DefaultRecoverTimeout,
 		recoverGrace:   DefaultRecoverGrace,
 		recoverPoll:    recoverPollInterval,
+		rotateTimeout:  DefaultRotateTimeout,
 		rotateSem:      make(chan struct{}, 1),
 	}
 	m.endpoint.Store(u)
@@ -270,7 +288,10 @@ func (m *Manager) Rotate(ctx context.Context) error {
 // which case it returns immediately and the caller should simply retry.
 //
 // Rotations are serialized, so a burst of failed requests switches the
-// gateway only once instead of flooding it with switch requests.
+// gateway only once instead of flooding it with switch requests. The whole
+// rotation, including the time spent queuing behind another one, is bounded
+// by DefaultRotateTimeout, so that a stalled gateway cannot block the
+// provider for minutes.
 func (m *Manager) RotateFrom(ctx context.Context, gen uint64) error {
 	m.mu.Lock()
 	gateway := m.gateway
@@ -279,6 +300,8 @@ func (m *Manager) RotateFrom(ctx context.Context, gen uint64) error {
 	if gateway == nil {
 		return ErrNoGateway
 	}
+	ctx, cancel := context.WithTimeout(ctx, m.rotateTimeoutDuration())
+	defer cancel()
 	select {
 	case m.rotateSem <- struct{}{}:
 		defer func() { <-m.rotateSem }()
@@ -297,16 +320,28 @@ func (m *Manager) RotateFrom(ctx context.Context, gen uint64) error {
 	return nil
 }
 
+func (m *Manager) rotateTimeoutDuration() time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.rotateTimeout <= 0 {
+		return DefaultRotateTimeout
+	}
+	return m.rotateTimeout
+}
+
 func (m *Manager) rotate(ctx context.Context, gateway *vpngate.Client, country string) error {
 	// A gateway with a dead tunnel switches the node by itself, and it rejects
 	// our switch requests meanwhile, so let it do the job if it is doing so.
-	recovering, err := m.observeRecovering(ctx, gateway)
+	recovering, err := m.observeRecovering(ctx, gateway, country)
 	if err != nil {
 		return err
 	}
 	if recovering {
 		if m.waitRecovered(ctx, gateway, country) {
 			return nil
+		}
+		if err = ctx.Err(); err != nil {
+			return err
 		}
 	}
 	nodes, _, err := gateway.Nodes(ctx)
@@ -335,20 +370,23 @@ func (m *Manager) rotate(ctx context.Context, gateway *vpngate.Client, country s
 	}
 	var lastErr error
 	for _, node := range candidates {
+		if lastErr = ctx.Err(); lastErr != nil {
+			break // the rotation budget has been exhausted.
+		}
 		if lastErr = gateway.Connect(ctx, node.ID); lastErr == nil {
 			return nil
 		}
 		// The gateway rejects the request if it is busy switching by itself,
 		// wait for it to settle instead of trying another node.
-		if _, status, err := gateway.Nodes(ctx); err == nil && status.IsConnecting {
+		if errors.Is(lastErr, vpngate.ErrSwitching) {
 			if m.waitRecovered(ctx, gateway, country) {
 				return nil
 			}
 			return fmt.Errorf("proxy: switch to node %s failed: %w", node.ID, lastErr)
 		}
-		if ctx.Err() != nil {
-			break
-		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("proxy: no node switch attempted")
 	}
 	return fmt.Errorf("proxy: switch node failed: %w", lastErr)
 }
@@ -356,13 +394,14 @@ func (m *Manager) rotate(ctx context.Context, gateway *vpngate.Client, country s
 // observeRecovering observes the gateway for a short grace period, and
 // reports whether it is recovering by itself, i.e. it is switching nodes or
 // its exit connectivity is down.
-func (m *Manager) observeRecovering(ctx context.Context, gateway *vpngate.Client) (bool, error) {
+func (m *Manager) observeRecovering(ctx context.Context, gateway *vpngate.Client, country string) (bool, error) {
 	deadline := time.Now().Add(m.recoverGrace)
 	for {
 		_, status, err := gateway.Nodes(ctx)
 		if err != nil {
 			return false, err
 		}
+		m.warnCountryMismatch(status, country)
 		if status.IsConnecting || !status.ProxyOK {
 			return true, nil
 		}
@@ -375,6 +414,36 @@ func (m *Manager) observeRecovering(ctx context.Context, gateway *vpngate.Client
 		case <-time.After(min(m.recoverPoll, time.Second)):
 		}
 	}
+}
+
+// countryMismatch reports why the gateway status may not provide an exit IP of
+// the given country, or an empty string if it looks fine.
+func countryMismatch(status vpngate.Status, country string) string {
+	country = strings.ToUpper(strings.TrimSpace(country))
+	if country == "" {
+		return ""
+	}
+	if mode := strings.TrimSpace(status.RoutingMode); mode != "" {
+		if !strings.EqualFold(mode, routingModeFixedRegion) {
+			return fmt.Sprintf("the routing mode is %q, want %q", mode, routingModeFixedRegion)
+		}
+	}
+	if forced := strings.ToUpper(strings.TrimSpace(status.ForceCountry)); forced != "" && forced != country {
+		return fmt.Sprintf("the forced country is %q, want %q", forced, country)
+	}
+	return ""
+}
+
+// warnCountryMismatch warns once about a gateway that may not provide an exit
+// IP of the given country, e.g. because it is not in the fixed region mode.
+func (m *Manager) warnCountryMismatch(status vpngate.Status, country string) {
+	problem := countryMismatch(status, country)
+	if problem == "" {
+		return
+	}
+	m.warnOnce.Do(func() {
+		log.Printf("[proxy] the VPN gateway may not provide a %s exit IP: %s", country, problem)
+	})
 }
 
 // waitRecovered waits until the gateway is connected to a usable node of the

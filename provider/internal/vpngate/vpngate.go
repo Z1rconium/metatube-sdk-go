@@ -39,6 +39,10 @@ const (
 // ErrUnauthorized is returned when the gateway rejects the credentials.
 var ErrUnauthorized = errors.New("vpngate: unauthorized")
 
+// ErrSwitching is returned when the gateway rejects a request because it is
+// switching nodes by itself. The request may be retried once it has settled.
+var ErrSwitching = errors.New("vpngate: gateway is switching nodes")
+
 // Config is the configuration of the gateway management API client.
 type Config struct {
 	// URL is the base URL of the gateway management API, which includes the
@@ -193,7 +197,14 @@ func (c *Client) Connect(ctx context.Context, nodeID string) error {
 		return err
 	}
 	if !resp.OK {
-		return fmt.Errorf("vpngate: connect node %s failed: %s", nodeID, resp.Error)
+		msg := resp.Error
+		if msg == "" {
+			msg = resp.Message
+		}
+		if isSwitchingMessage(msg) {
+			return fmt.Errorf("%w: %s", ErrSwitching, msg)
+		}
+		return fmt.Errorf("vpngate: connect node %s failed: %s", nodeID, msg)
 	}
 	return nil
 }
@@ -253,6 +264,9 @@ func (c *Client) request(ctx context.Context, method, path string, in any) ([]by
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		return nil, ErrUnauthorized
+	}
+	if resp.StatusCode == http.StatusConflict {
+		return nil, fmt.Errorf("%w: %s", ErrSwitching, apiError(body, resp.Status))
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("vpngate: %s %s: %s", method, path, apiError(body, resp.Status))
@@ -324,4 +338,26 @@ func apiError(body []byte, status string) string {
 		return resp.Error
 	}
 	return status
+}
+
+// isSwitchingMessage reports whether the given gateway error message indicates
+// that the gateway is switching nodes by itself, in which case the request is
+// rejected until it has settled.
+func isSwitchingMessage(msg string) bool {
+	msg = strings.ToLower(strings.TrimSpace(msg))
+	if msg == "" {
+		return false
+	}
+	for _, s := range []string{
+		"switch task is running",
+		"switching",
+		"reconnecting",
+		"正在切换",
+		"切换中",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }

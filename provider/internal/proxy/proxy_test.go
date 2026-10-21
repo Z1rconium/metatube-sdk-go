@@ -48,7 +48,7 @@ func TestManager_ProxyFunc(t *testing.T) {
 	require.NotNil(t, u)
 	assert.Equal(t, "127.0.0.1:7928", u.Host)
 
-	// Fall back to direct server egress.
+	// Fall back to the default server egress.
 	m.Fallback()
 	assert.True(t, m.InFallback())
 	u, err = m.ProxyFunc(&http.Request{})
@@ -234,6 +234,27 @@ func TestManager_Rotate(t *testing.T) {
 		cancel()
 		assert.ErrorIs(t, m.Rotate(ctx), context.Canceled)
 	})
+}
+
+func TestManager_ProxyFunc_FallbackProxy(t *testing.T) {
+	m, err := New("http://127.0.0.1:7928")
+	require.NoError(t, err)
+
+	// While falling back, the proxy of the user is used instead of the exit
+	// of the gateway, so that the traffic never goes direct if the user has
+	// configured a proxy for the server.
+	userProxy, _ := url.Parse("http://127.0.0.1:10800")
+	m.fallbackProxy = func(*http.Request) (*url.URL, error) { return userProxy, nil }
+	m.Fallback()
+	req := httptest.NewRequest(http.MethodGet, "https://www.dmm.co.jp/", nil)
+	u, err := m.ProxyFunc(req)
+	require.NoError(t, err)
+	assert.Equal(t, userProxy, u)
+
+	m.Restore()
+	u, err = m.ProxyFunc(req)
+	require.NoError(t, err)
+	assert.Equal(t, "http://127.0.0.1:7928", u.String())
 }
 
 func TestManager_ProxyFunc_ResumeAfterCooldown(t *testing.T) {

@@ -3,7 +3,7 @@
 // The proxy endpoint (e.g. the local listener of an aimili-vpngate gateway)
 // stays stable, while the exit IP behind it can be rotated on demand through
 // the gateway management API. When the exit IP turns out to be unusable, the
-// manager is also able to fall back to direct server egress.
+// manager is also able to fall back to the default server egress.
 package proxy
 
 import (
@@ -26,7 +26,7 @@ import (
 )
 
 // DefaultFallbackCooldown is the minimum duration before the proxy is probed
-// again after it has fallen back to direct server egress.
+// again after it has fallen back to the default server egress.
 const DefaultFallbackCooldown = time.Minute
 
 // DefaultRecoverTimeout is the maximum duration to wait for the gateway to
@@ -94,6 +94,11 @@ type Manager struct {
 	fellBack  atomic.Int64 // unix nanoseconds
 	transport *http.Transport
 
+	// fallbackProxy decides the proxy in use while falling back. It defaults
+	// to the proxy configured by the environment (e.g. HTTPS_PROXY), i.e. the
+	// one that the other providers keep using, or direct egress if none.
+	fallbackProxy func(*http.Request) (*url.URL, error)
+
 	mu       sync.Mutex
 	gateway  *vpngate.Client
 	country  string
@@ -129,6 +134,7 @@ func New(rawURL string) (*Manager, error) {
 		return nil, fmt.Errorf("proxy: unsupported proxy scheme %q", u.Scheme)
 	}
 	m := &Manager{
+		fallbackProxy:  http.ProxyFromEnvironment,
 		cooldown:       DefaultFallbackCooldown,
 		recoverTimeout: DefaultRecoverTimeout,
 		recoverGrace:   DefaultRecoverGrace,
@@ -164,14 +170,19 @@ func (m *Manager) Country() string {
 }
 
 // ProxyFunc returns the proxy function of the manager, which is invoked for
-// every HTTP request. A nil URL indicates direct server egress.
+// every HTTP request.
 //
+// While falling back, it returns the default server egress, which is the
+// proxy configured by the environment, if any, or a nil URL for direct egress.
 // Once the cooldown has elapsed, the proxy is resumed on the next request. If
 // it is still unusable, the failed request falls the manager back again.
-func (m *Manager) ProxyFunc(*http.Request) (*url.URL, error) {
+func (m *Manager) ProxyFunc(req *http.Request) (*url.URL, error) {
 	if m.fallback.Load() {
 		if time.Since(m.fellBackTime()) < m.cooldownDuration() {
-			return nil, nil // fall back to direct server egress.
+			if req == nil || req.URL == nil {
+				return nil, nil
+			}
+			return m.fallbackProxy(req) // fall back to the default egress.
 		}
 		m.Restore() // the cooldown has elapsed, probe the proxy again.
 	}
@@ -195,10 +206,19 @@ func (m *Manager) Endpoint() string {
 	return ""
 }
 
-// InFallback reports whether the manager is falling back to direct egress.
+// HasGateway reports whether a VPN gateway is configured.
+func (m *Manager) HasGateway() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.gateway != nil
+}
+
+// InFallback reports whether the manager is falling back to the default
+// server egress.
 func (m *Manager) InFallback() bool { return m.fallback.Load() }
 
-// Fallback switches to direct server egress.
+// Fallback switches to the default server egress, i.e. the proxy configured by
+// the environment, if any, or direct egress.
 func (m *Manager) Fallback() {
 	if m.fallback.Swap(true) {
 		return
@@ -218,7 +238,7 @@ func (m *Manager) Restore() {
 // CanRotate reports whether a new exit IP can be acquired on demand.
 //
 // It returns false if no VPN gateway is configured, or if the proxy has just
-// fallen back to direct server egress and the cooldown has not elapsed yet.
+// fallen back to the default server egress and the cooldown has not elapsed yet.
 func (m *Manager) CanRotate() bool {
 	m.mu.Lock()
 	gateway := m.gateway
@@ -380,8 +400,8 @@ func (m *Manager) waitRecovered(ctx context.Context, gateway *vpngate.Client, co
 	}
 }
 
-// fellBackTime returns the time at which the manager fell back to direct
-// server egress.
+// fellBackTime returns the time at which the manager fell back to the
+// default server egress.
 func (m *Manager) fellBackTime() time.Time {
 	nsec := m.fellBack.Load()
 	if nsec == 0 {

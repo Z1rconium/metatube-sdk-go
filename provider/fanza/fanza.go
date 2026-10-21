@@ -855,6 +855,12 @@ func (fz *FANZA) getMovieReviewsByID(id string) (reviews []*model.MovieReviewDet
 //
 // It is a no-op if no proxy is configured for the provider.
 func (fz *FANZA) fetchWithExitFallback(fetch func() error) error {
+	var generation uint64
+	if fz.proxy != nil {
+		// Remember the exit IP in use, so that concurrent failures of the same
+		// exit IP rotate it only once.
+		generation = fz.proxy.Generation()
+	}
 	err := fetch()
 	if err == nil || !fz.isExitUnusable(err) {
 		return err
@@ -865,7 +871,7 @@ func (fz *FANZA) fetchWithExitFallback(fetch func() error) error {
 	// The current exit IP is unusable, try to acquire a new one.
 	if fz.proxy.CanRotate() {
 		log.Printf("[FANZA] exit IP is unusable, acquiring a new one: %v", err)
-		if rErr := fz.proxy.Rotate(context.Background()); rErr != nil {
+		if rErr := fz.proxy.RotateFrom(context.Background(), generation); rErr != nil {
 			log.Printf("[FANZA] failed to acquire a new exit IP: %v", rErr)
 		} else {
 			err = fetch()

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -87,71 +88,182 @@ func TestManager_CanRotate(t *testing.T) {
 	assert.True(t, m.CanRotate())
 }
 
-func TestManager_Rotate(t *testing.T) {
-	m, err := New("http://127.0.0.1:7928")
-	require.NoError(t, err)
+// fakeGateway is a fake aimili-vpngate management API.
+type fakeGateway struct {
+	*httptest.Server
 
-	// No gateway configured.
-	assert.ErrorIs(t, m.Rotate(context.Background()), ErrNoGateway)
+	// connectingPolls is the number of the status requests that report the
+	// gateway as switching nodes by itself, in which case switch requests are
+	// rejected.
+	connectingPolls int32
+	// failConnects is the number of the switch requests that fail on
+	// pre-check, before one succeeds.
+	failConnects int32
+
+	polls    atomic.Int32
+	connects atomic.Int32
 }
 
-// newBusyGateway returns a fake gateway that rejects node switch requests, as
-// it does while reconnecting by itself. The gateway is reported as connecting
-// until the given number of status requests have been served.
-func newBusyGateway(t *testing.T, connectingPolls int32) *httptest.Server {
+func newFakeGateway(t *testing.T, connectingPolls, failConnects int32) *fakeGateway {
 	t.Helper()
-	var polls atomic.Int32
+	g := &fakeGateway{connectingPolls: connectingPolls, failConnects: failConnects}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/secret/api/login", func(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{Name: "session", Value: "token", Path: "/secret/"})
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 	mux.HandleFunc("/secret/api/nodes", func(w http.ResponseWriter, r *http.Request) {
-		connecting := polls.Add(1) <= connectingPolls
+		g.polls.Add(1)
+		connecting := g.connecting()
 		_, _ = fmt.Fprintf(w, `{"nodes":[
 			{"id":"JP_1.2.3.4_443_udp","country_short":"JP","probe_status":"available","latency_ms":120,"active":%t},
-			{"id":"JP_5.6.7.8_443_tcp","country_short":"JP","probe_status":"available","latency_ms":80,"active":false}
+			{"id":"JP_5.6.7.8_443_tcp","country_short":"JP","probe_status":"available","latency_ms":80,"active":false},
+			{"id":"JP_9.9.9.9_443_tcp","country_short":"JP","probe_status":"available","latency_ms":90,"active":false},
+			{"id":"JP_8.8.8.8_443_tcp","country_short":"JP","probe_status":"available","latency_ms":100,"active":false},
+			{"id":"JP_7.7.7.7_443_tcp","country_short":"JP","probe_status":"available","latency_ms":110,"active":false},
+			{"id":"US_6.6.6.6_443_tcp","country_short":"US","probe_status":"available","latency_ms":1,"active":false}
 		],"state":{"proxy_ok":%t,"is_connecting":%t}}`, !connecting, !connecting, connecting)
 	})
 	mux.HandleFunc("/secret/api/connect", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusConflict)
-		_, _ = w.Write([]byte(`{"ok":false,"error":"switch task is running"}`))
+		n := g.connects.Add(1)
+		switch {
+		case g.connecting():
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"ok":false,"error":"switch task is running"}`))
+		case n <= g.failConnects:
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"ok":false,"error":"pre-check failed"}`))
+		default:
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		}
 	})
-	return httptest.NewServer(mux)
+	g.Server = httptest.NewServer(mux)
+	t.Cleanup(g.Close)
+	return g
 }
 
-func TestManager_Rotate_GatewayBusy(t *testing.T) {
-	newManager := func(t *testing.T, srv *httptest.Server) *Manager {
-		t.Helper()
-		gateway, err := vpngate.NewClient(vpngate.Config{URL: srv.URL + "/secret", Username: "admin", Password: "secret"})
-		require.NoError(t, err)
-		m, err := New("http://127.0.0.1:7928")
-		require.NoError(t, err)
-		m.SetGateway(gateway, "JP")
-		m.recoverPoll = 10 * time.Millisecond
-		m.recoverTimeout = 500 * time.Millisecond
-		return m
-	}
+// connecting reports whether the gateway is switching nodes by itself. It is
+// derived from the number of the status requests served so far, so that the
+// gateway "recovers" as it is being polled.
+func (g *fakeGateway) connecting() bool {
+	return g.polls.Load() <= g.connectingPolls
+}
 
-	t.Run("recovers", func(t *testing.T) {
-		srv := newBusyGateway(t, 3)
-		defer srv.Close()
-		m := newManager(t, srv)
+func newTestManager(t *testing.T, g *fakeGateway) *Manager {
+	t.Helper()
+	gateway, err := vpngate.NewClient(vpngate.Config{URL: g.URL + "/secret", Username: "admin", Password: "secret"})
+	require.NoError(t, err)
+	m, err := New("http://127.0.0.1:7928")
+	require.NoError(t, err)
+	m.SetGateway(gateway, "JP")
+	m.recoverPoll = 10 * time.Millisecond
+	m.recoverGrace = 30 * time.Millisecond
+	m.recoverTimeout = 500 * time.Millisecond
+	return m
+}
+
+func TestManager_Rotate(t *testing.T) {
+	t.Run("SelfHealing", func(t *testing.T) {
+		// The gateway recovers by itself, so no switch request is sent.
+		g := newFakeGateway(t, 3, 0)
+		m := newTestManager(t, g)
 		m.Fallback()
-		// The gateway settles on a JP node by itself, so no error is returned
-		// and the proxy is resumed.
 		require.NoError(t, m.Rotate(context.Background()))
+		assert.EqualValues(t, 0, g.connects.Load())
 		assert.False(t, m.InFallback())
 	})
 
-	t.Run("timeout", func(t *testing.T) {
-		srv := newBusyGateway(t, 1<<30)
-		defer srv.Close()
-		m := newManager(t, srv)
+	t.Run("SelfHealingTimeout", func(t *testing.T) {
+		g := newFakeGateway(t, 1<<30, 0)
+		m := newTestManager(t, g)
 		m.Fallback()
 		assert.Error(t, m.Rotate(context.Background()))
 		assert.True(t, m.InFallback())
+		assert.EqualValues(t, 0, m.Generation())
 	})
+
+	t.Run("NextCandidate", func(t *testing.T) {
+		// The pre-check of the best node fails, so the next one is tried.
+		g := newFakeGateway(t, 0, 1)
+		m := newTestManager(t, g)
+		require.NoError(t, m.Rotate(context.Background()))
+		assert.EqualValues(t, 2, g.connects.Load())
+		assert.EqualValues(t, 1, m.Generation())
+	})
+
+	t.Run("AllCandidatesFailed", func(t *testing.T) {
+		g := newFakeGateway(t, 0, 100)
+		m := newTestManager(t, g)
+		assert.Error(t, m.Rotate(context.Background()))
+		assert.EqualValues(t, maxSwitchCandidates, g.connects.Load())
+		assert.EqualValues(t, 0, m.Generation())
+	})
+
+	t.Run("StaleGeneration", func(t *testing.T) {
+		// The exit IP has been rotated since the caller observed its failure.
+		g := newFakeGateway(t, 0, 0)
+		m := newTestManager(t, g)
+		require.NoError(t, m.Rotate(context.Background()))
+		require.NoError(t, m.RotateFrom(context.Background(), 0))
+		assert.EqualValues(t, 1, g.connects.Load())
+		assert.EqualValues(t, 1, m.Generation())
+	})
+
+	t.Run("Concurrent", func(t *testing.T) {
+		// A burst of the failures of the same exit IP rotates it only once.
+		g := newFakeGateway(t, 0, 0)
+		m := newTestManager(t, g)
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				assert.NoError(t, m.RotateFrom(context.Background(), 0))
+			}()
+		}
+		wg.Wait()
+		assert.EqualValues(t, 1, g.connects.Load())
+		assert.EqualValues(t, 1, m.Generation())
+	})
+
+	t.Run("ContextCanceled", func(t *testing.T) {
+		g := newFakeGateway(t, 0, 0)
+		m := newTestManager(t, g)
+		m.rotateSem <- struct{}{} // a rotation is in flight.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		assert.ErrorIs(t, m.Rotate(ctx), context.Canceled)
+	})
+}
+
+func TestManager_ProxyFunc_ResumeAfterCooldown(t *testing.T) {
+	m, err := New("http://127.0.0.1:7928")
+	require.NoError(t, err)
+	m.cooldown = 50 * time.Millisecond
+
+	u, err := m.ProxyFunc(nil)
+	require.NoError(t, err)
+	require.NotNil(t, u)
+
+	// Direct egress within the cooldown.
+	m.Fallback()
+	u, err = m.ProxyFunc(nil)
+	require.NoError(t, err)
+	assert.Nil(t, u)
+	assert.True(t, m.InFallback())
+
+	// The proxy is probed again once the cooldown has elapsed.
+	time.Sleep(60 * time.Millisecond)
+	u, err = m.ProxyFunc(nil)
+	require.NoError(t, err)
+	require.NotNil(t, u)
+	assert.False(t, m.InFallback())
+}
+
+func TestManager_Rotate_NoGateway(t *testing.T) {
+	m, err := New("http://127.0.0.1:7928")
+	require.NoError(t, err)
+	assert.ErrorIs(t, m.Rotate(context.Background()), ErrNoGateway)
 }
 
 func TestIsTransportError(t *testing.T) {

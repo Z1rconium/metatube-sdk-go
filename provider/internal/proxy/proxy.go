@@ -27,15 +27,23 @@ import (
 
 // DefaultFallbackCooldown is the minimum duration before the proxy is probed
 // again after it has fallen back to direct server egress.
-const DefaultFallbackCooldown = 5 * time.Minute
+const DefaultFallbackCooldown = time.Minute
 
 // DefaultRecoverTimeout is the maximum duration to wait for the gateway to
 // recover by itself, when it rejects a node switch request.
 const DefaultRecoverTimeout = 90 * time.Second
 
+// DefaultRecoverGrace is the duration to observe the gateway before switching
+// its node on our own, since a gateway with a dead tunnel switches nodes by
+// itself and rejects (and penalizes) concurrent switch requests.
+const DefaultRecoverGrace = 4 * time.Second
+
 // recoverPollInterval is the interval of polling the gateway status while
 // waiting for it to recover.
 const recoverPollInterval = 2 * time.Second
+
+// maxSwitchCandidates is the maximum number of nodes to try when switching.
+const maxSwitchCandidates = 3
 
 // ErrNoGateway is returned when no VPN gateway is configured.
 var ErrNoGateway = errors.New("proxy: no vpn gateway configured")
@@ -92,7 +100,13 @@ type Manager struct {
 	cooldown time.Duration
 
 	recoverTimeout time.Duration
+	recoverGrace   time.Duration
 	recoverPoll    time.Duration
+
+	// gen counts the completed rotations, so that concurrent callers that
+	// have failed with the same exit IP rotate it only once.
+	gen       atomic.Uint64
+	rotateSem chan struct{}
 }
 
 // New returns a proxy manager for the given proxy endpoint, which may be an
@@ -117,7 +131,9 @@ func New(rawURL string) (*Manager, error) {
 	m := &Manager{
 		cooldown:       DefaultFallbackCooldown,
 		recoverTimeout: DefaultRecoverTimeout,
+		recoverGrace:   DefaultRecoverGrace,
 		recoverPoll:    recoverPollInterval,
+		rotateSem:      make(chan struct{}, 1),
 	}
 	m.endpoint.Store(u)
 	transport := &http.Transport{Proxy: m.ProxyFunc, DisableKeepAlives: true}
@@ -149,11 +165,23 @@ func (m *Manager) Country() string {
 
 // ProxyFunc returns the proxy function of the manager, which is invoked for
 // every HTTP request. A nil URL indicates direct server egress.
+//
+// Once the cooldown has elapsed, the proxy is resumed on the next request. If
+// it is still unusable, the failed request falls the manager back again.
 func (m *Manager) ProxyFunc(*http.Request) (*url.URL, error) {
 	if m.fallback.Load() {
-		return nil, nil // fall back to direct server egress.
+		if time.Since(m.fellBackTime()) < m.cooldownDuration() {
+			return nil, nil // fall back to direct server egress.
+		}
+		m.Restore() // the cooldown has elapsed, probe the proxy again.
 	}
 	return m.endpoint.Load(), nil
+}
+
+func (m *Manager) cooldownDuration() time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cooldown
 }
 
 // Transport returns the HTTP transport bound to the manager.
@@ -206,15 +234,60 @@ func (m *Manager) CanRotate() bool {
 	return true
 }
 
+// Generation returns the number of the completed rotations. Callers should
+// read it before using the exit IP and pass it to RotateFrom, if the exit IP
+// turns out to be unusable.
+func (m *Manager) Generation() uint64 { return m.gen.Load() }
+
 // Rotate acquires a new exit IP through the VPN gateway, which switches the
 // gateway to another node of the preferred country.
 func (m *Manager) Rotate(ctx context.Context) error {
+	return m.RotateFrom(ctx, m.Generation())
+}
+
+// RotateFrom acquires a new exit IP like Rotate, unless the exit IP of the
+// given generation has been rotated by another caller in the meantime, in
+// which case it returns immediately and the caller should simply retry.
+//
+// Rotations are serialized, so a burst of failed requests switches the
+// gateway only once instead of flooding it with switch requests.
+func (m *Manager) RotateFrom(ctx context.Context, gen uint64) error {
 	m.mu.Lock()
 	gateway := m.gateway
 	country := m.country
 	m.mu.Unlock()
 	if gateway == nil {
 		return ErrNoGateway
+	}
+	select {
+	case m.rotateSem <- struct{}{}:
+		defer func() { <-m.rotateSem }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if m.gen.Load() != gen {
+		return nil // another caller has just acquired a new exit IP.
+	}
+	if err := m.rotate(ctx, gateway, country); err != nil {
+		return err
+	}
+	// The exit IP has been switched, resume the proxy if it was falling back.
+	m.gen.Add(1)
+	m.Restore()
+	return nil
+}
+
+func (m *Manager) rotate(ctx context.Context, gateway *vpngate.Client, country string) error {
+	// A gateway with a dead tunnel switches the node by itself, and it rejects
+	// our switch requests meanwhile, so let it do the job if it is doing so.
+	recovering, err := m.observeRecovering(ctx, gateway)
+	if err != nil {
+		return err
+	}
+	if recovering {
+		if m.waitRecovered(ctx, gateway, country) {
+			return nil
+		}
 	}
 	nodes, _, err := gateway.Nodes(ctx)
 	if err != nil {
@@ -237,18 +310,51 @@ func (m *Manager) Rotate(ctx context.Context) error {
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return candidates[i].LatencyMS < candidates[j].LatencyMS
 	})
-	node := candidates[0]
-	if err = gateway.Connect(ctx, node.ID); err != nil {
-		// The gateway rejects the request if it is busy reconnecting by
-		// itself, e.g. after the tunnel has just died. Wait for it to settle
-		// on a node of the preferred country instead of giving up.
-		if !m.waitRecovered(ctx, gateway, country) {
-			return fmt.Errorf("proxy: switch to node %s failed: %w", node.ID, err)
+	if len(candidates) > maxSwitchCandidates {
+		candidates = candidates[:maxSwitchCandidates]
+	}
+	var lastErr error
+	for _, node := range candidates {
+		if lastErr = gateway.Connect(ctx, node.ID); lastErr == nil {
+			return nil
+		}
+		// The gateway rejects the request if it is busy switching by itself,
+		// wait for it to settle instead of trying another node.
+		if _, status, err := gateway.Nodes(ctx); err == nil && status.IsConnecting {
+			if m.waitRecovered(ctx, gateway, country) {
+				return nil
+			}
+			return fmt.Errorf("proxy: switch to node %s failed: %w", node.ID, lastErr)
+		}
+		if ctx.Err() != nil {
+			break
 		}
 	}
-	// The exit IP has been switched, resume the proxy if it was falling back.
-	m.Restore()
-	return nil
+	return fmt.Errorf("proxy: switch node failed: %w", lastErr)
+}
+
+// observeRecovering observes the gateway for a short grace period, and
+// reports whether it is recovering by itself, i.e. it is switching nodes or
+// its exit connectivity is down.
+func (m *Manager) observeRecovering(ctx context.Context, gateway *vpngate.Client) (bool, error) {
+	deadline := time.Now().Add(m.recoverGrace)
+	for {
+		_, status, err := gateway.Nodes(ctx)
+		if err != nil {
+			return false, err
+		}
+		if status.IsConnecting || !status.ProxyOK {
+			return true, nil
+		}
+		if !time.Now().Before(deadline) {
+			return false, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(min(m.recoverPoll, time.Second)):
+		}
+	}
 }
 
 // waitRecovered waits until the gateway is connected to a usable node of the

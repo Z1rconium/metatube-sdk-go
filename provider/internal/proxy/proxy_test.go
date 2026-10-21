@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -386,9 +387,50 @@ func TestManager_Transport(t *testing.T) {
 	require.NotNil(t, m.Transport())
 	assert.NotNil(t, m.Transport().Proxy)
 
+	// The connections may be kept alive: switching the egress closes them.
+	assert.False(t, m.Transport().DisableKeepAlives)
+
 	// The transport must not outlive the test.
 	t.Cleanup(func() { m.Transport().CloseIdleConnections() })
 	time.Sleep(time.Millisecond)
+}
+
+func TestManager_Transport_EgressSwitch(t *testing.T) {
+	// Each proxy answers with its own label, so the egress in use is visible.
+	label := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(name))
+		}))
+	}
+	proxyA, proxyB := label("A"), label("B")
+	defer proxyA.Close()
+	defer proxyB.Close()
+
+	proxyBURL, err := url.Parse(proxyB.URL)
+	require.NoError(t, err)
+
+	m, err := New(proxyA.URL)
+	require.NoError(t, err)
+	m.fallbackProxy = func(*http.Request) (*url.URL, error) { return proxyBURL, nil }
+	client := &http.Client{Transport: m.Transport()}
+
+	get := func() string {
+		t.Helper()
+		resp, err := client.Get("http://www.dmm.co.jp/")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		return string(body)
+	}
+
+	assert.Equal(t, "A", get())
+	// The idle connection to the gateway must not be reused while falling
+	// back, even though the connections are kept alive.
+	m.Fallback()
+	assert.Equal(t, "B", get())
+	m.Restore()
+	assert.Equal(t, "A", get())
 }
 
 func TestCheckStatus(t *testing.T) {

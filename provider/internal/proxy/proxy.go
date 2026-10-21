@@ -161,11 +161,10 @@ func New(rawURL string) (*Manager, error) {
 		rotateSem:      make(chan struct{}, 1),
 	}
 	m.endpoint.Store(u)
-	transport := &http.Transport{Proxy: m.ProxyFunc, DisableKeepAlives: true}
+	transport := &http.Transport{Proxy: m.ProxyFunc}
 	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
 		transport = dt.Clone()
 		transport.Proxy = m.ProxyFunc
-		transport.DisableKeepAlives = true
 	}
 	m.transport = transport
 	return m, nil
@@ -215,6 +214,9 @@ func (m *Manager) cooldownDuration() time.Duration {
 }
 
 // Transport returns the HTTP transport bound to the manager.
+//
+// It should be shared by every client of the provider, so that switching the
+// proxy closes the idle connections of all of them; see Fallback and Restore.
 func (m *Manager) Transport() *http.Transport { return m.transport }
 
 // Endpoint returns the proxy endpoint in use.
@@ -238,6 +240,9 @@ func (m *Manager) InFallback() bool { return m.fallback.Load() }
 
 // Fallback switches to the default server egress, i.e. the proxy configured by
 // the environment, if any, or direct egress.
+//
+// The idle connections are closed, so that the ongoing requests are re-issued
+// through the new egress instead of reusing the connections to the old one.
 func (m *Manager) Fallback() {
 	if m.fallback.Swap(true) {
 		return
@@ -247,6 +252,9 @@ func (m *Manager) Fallback() {
 }
 
 // Restore switches back to the proxy endpoint.
+//
+// The idle connections of the fallback egress are closed, so that the next
+// requests are made through the proxy again.
 func (m *Manager) Restore() {
 	if !m.fallback.Swap(false) {
 		return

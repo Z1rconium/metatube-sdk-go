@@ -325,6 +325,10 @@ func (m *Manager) RotateFrom(ctx context.Context, gen uint64) error {
 	}
 	// The exit IP has been switched, resume the proxy if it was falling back.
 	m.gen.Add(1)
+	// The pooled connections still point at the exit IP that the gateway has
+	// just torn down, so drop them even when the manager is not falling back;
+	// otherwise the next requests hang on the dead tunnels.
+	m.transport.CloseIdleConnections()
 	m.Restore()
 	return nil
 }

@@ -58,13 +58,13 @@ HTTP/HTTPS/SOCKS5 proxy. Its management API is used to acquire a fresh exit IP o
 
 ### Configuration
 
-| Config key       | Description                                                                                 |
-|------------------|---------------------------------------------------------------------------------------------|
-| `proxy`          | The http or socks5 proxy endpoint, `http://127.0.0.1:7928` by default                       |
-| `vpngate_url`    | The base URL of the gateway management API, including the secret path                        |
-| `vpngate_username` | The username of the gateway management backend                                             |
-| `vpngate_password` | The password of the gateway management backend                                             |
-| `vpngate_country`  | The ISO country code of the exit IP, `JP` by default                                      |
+| Config key         | Description                                                                    |
+|--------------------|--------------------------------------------------------------------------------|
+| `proxy`            | The http or socks5 proxy endpoint, `http://127.0.0.1:7928` by default          |
+| `vpngate_url`      | The base URL of the gateway management API, including the secret path          |
+| `vpngate_username` | The username of the gateway management backend                                 |
+| `vpngate_password` | The password of the gateway management backend                                 |
+| `vpngate_country`  | The ISO country code of the exit IP, `JP` by default                           |
 
 ```sh
 export MT_MOVIE_PROVIDER_FANZA__VPNGATE_URL=http://admin:secret@127.0.0.1:8787/YOUR_SECRET_PATH
@@ -87,6 +87,10 @@ still region-restricted, the provider falls back as follows:
      provider waits for it to settle instead of sending a competing switch request.
    - Concurrent failures of the same exit IP are coalesced into a single switch.
    - If the best node cannot be connected, the next best nodes are tried.
+   - The whole rotation is bounded to two minutes, so that a gateway that stops answering
+     cannot block the provider for longer than that.
+   - Only the failures that another exit IP can fix trigger a rotation, e.g. a dead tunnel or
+     a region-restricted page; a host that does not exist does not.
 3. If it still fails, the provider falls back to the default server egress for one minute,
    and then resumes the gateway proxy on the next request. If it is still unusable, it falls
    back again. The default server egress is the proxy that you have configured for the
@@ -100,7 +104,8 @@ still region-restricted, the provider falls back as follows:
   `ssh -N -L 7928:127.0.0.1:7928 -L 8787:127.0.0.1:8787 root@VPS`.
 - The gateway must be configured with the target country, e.g. the routing mode
   `fixed_region` with `force_country` set to `JP`, otherwise the exit IP may not be
-  located in the requested region.
+  located in the requested region. The provider logs a warning once when the routing
+  mode or the forced country of the gateway does not match the configured country.
 - The gateway only takes over the providers that are configured with `vpngate_url`, i.e. the
   region-restricted ones such as `FANZA`. All the other providers keep using whatever you
   have configured for them, i.e. their own `proxy` config, or `HTTP_PROXY` / `HTTPS_PROXY`,

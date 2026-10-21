@@ -134,3 +134,23 @@ func TestFANZA_SetConfig(t *testing.T) {
 	// closes the idle connections of both the scraper and the API client.
 	assert.Same(t, fz.proxy.Transport(), fz.Scraper.Transport())
 }
+
+func TestFANZA_SetConfigThenSetProxy(t *testing.T) {
+	gateway := newTestVPNGateway(t)
+	defer gateway.Close()
+
+	fz := New()
+	config := envconfig.NewConfig()
+	config.Set("vpngate_url", gateway.URL+"/secret")
+	config.Set("vpngate_username", "admin")
+	config.Set("vpngate_password", "secret")
+	require.NoError(t, fz.SetConfig(config))
+
+	// A proxy that is configured afterwards must keep the gateway, so that
+	// the config and the proxy may be applied in any order.
+	require.NoError(t, fz.SetProxy("http://127.0.0.1:9999"))
+	assert.Equal(t, "http://127.0.0.1:9999", fz.proxy.Endpoint())
+	assert.True(t, fz.proxy.HasGateway())
+	assert.True(t, fz.proxy.CanRotate())
+	assert.Same(t, fz.proxy.Transport(), fz.Scraper.Transport())
+}

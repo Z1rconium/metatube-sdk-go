@@ -84,6 +84,9 @@ type FANZA struct {
 	// proxy manages the outbound proxy of the provider, which is used to
 	// access the region-restricted pages through a foreign exit IP.
 	proxy *proxy.Manager
+	// gateway rotates the exit IP of the proxy on demand, if configured.
+	gateway        *vpngate.Client
+	gatewayCountry string
 }
 
 func New() *FANZA {
@@ -120,11 +123,21 @@ func (fz *FANZA) SetProxy(proxyURL string) error {
 		return err
 	}
 	fz.proxy = m
+	fz.applyGateway()
 	fz.Scraper.SetTransport(m.Transport())
 	// The GraphQL API client ignores the response status, so wrap the
 	// transport to surface the gateway errors of a dead VPN tunnel.
 	fz.httpClient.Transport = proxy.CheckStatus(m.Transport())
 	return nil
+}
+
+// applyGateway attaches the configured VPN gateway to the proxy manager, so
+// that the exit IP can be rotated. It is a no-op if either of them is unset.
+func (fz *FANZA) applyGateway() {
+	if fz.proxy == nil || fz.gateway == nil {
+		return
+	}
+	fz.proxy.SetGateway(fz.gateway, fz.gatewayCountry)
 }
 
 // SetConfig sets the additional configs for the FANZA provider.
@@ -164,13 +177,15 @@ func (fz *FANZA) SetConfig(config provider.Config) error {
 	if err != nil {
 		return err
 	}
+	// Remember the gateway, so that it survives a proxy that is configured
+	// afterwards, e.g. by the engine or by an SDK user.
+	fz.gateway = gateway
+	fz.gatewayCountry = gatewayConfig.Country
 	if fz.proxy == nil {
 		// No proxy configured, fall back to the default gateway proxy.
-		if err = fz.SetProxy(defaultVPNGatewayProxy); err != nil {
-			return err
-		}
+		return fz.SetProxy(defaultVPNGatewayProxy)
 	}
-	fz.proxy.SetGateway(gateway, gatewayConfig.Country)
+	fz.applyGateway()
 	return nil
 }
 
@@ -216,6 +231,11 @@ func (fz *FANZA) getMovieInfoByID(id string) (info *model.MovieInfo, err error) 
 		if errors.Is(err, ErrRegionNotAvailable) {
 			regionErr = err
 			continue
+		}
+		// A dead tunnel would fail the remaining homepages the same way, so
+		// let the caller rotate the exit IP or fall back at once.
+		if fz.isExitUnusable(err) {
+			break
 		}
 	}
 	if regionErr != nil {
@@ -866,9 +886,18 @@ func (fz *FANZA) GetMovieReviewsByID(id string) (reviews []*model.MovieReviewDet
 
 func (fz *FANZA) getMovieReviewsByID(id string) (reviews []*model.MovieReviewDetail, err error) {
 	for _, homepage := range fz.getHomepagesByID(id) {
-		if reviews, err = fz.getMovieReviewsByURL(homepage); err == nil && len(reviews) > 0 {
+		reviews, err = fz.getMovieReviewsByURL(homepage)
+		if err == nil && len(reviews) > 0 {
 			return
 		}
+		// A dead tunnel would fail the remaining homepages the same way, so
+		// let the caller rotate the exit IP or fall back at once.
+		if fz.isExitUnusable(err) && !errors.Is(err, ErrRegionNotAvailable) {
+			break
+		}
+	}
+	if fz.isExitUnusable(err) {
+		return nil, err // the exit IP is unusable, do not hide it.
 	}
 	return nil, provider.ErrInfoNotFound
 }

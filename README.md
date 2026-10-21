@@ -14,6 +14,7 @@ Metadata Tube SDK in Golang.
     - [Contents](#contents)
     - [Features](#features)
     - [Installation](#installation)
+    - [Region-restricted providers](#region-restricted-providers)
     - [Credits](#credits)
     - [License](#license)
 
@@ -44,6 +45,58 @@ the below Go command to install SDK.
 ```sh
 go get -u github.com/metatube-community/metatube-sdk-go
 ```
+
+## Region-restricted providers
+
+Some providers are only accessible from a specific region, e.g. the mono/DVD pages of
+`FANZA` (DMM) are restricted to Japan. Such providers can be accessed through a foreign
+exit IP by configuring a proxy for them.
+
+The recommended setup is an [aimili-vpngate](https://github.com/OpenMili/aimili-vpngate)
+gateway, which runs a VPNGate tunnel on a Linux host and exposes it as a local
+HTTP/HTTPS/SOCKS5 proxy. Its management API is used to acquire a fresh exit IP on demand.
+
+### Configuration
+
+| Config key       | Description                                                                                 |
+|------------------|---------------------------------------------------------------------------------------------|
+| `proxy`          | The http or socks5 proxy endpoint, `http://127.0.0.1:7928` by default                       |
+| `vpngate_url`    | The base URL of the gateway management API, including the secret path                        |
+| `vpngate_username` | The username of the gateway management backend                                             |
+| `vpngate_password` | The password of the gateway management backend                                             |
+| `vpngate_country`  | The ISO country code of the exit IP, `JP` by default                                      |
+
+```sh
+export MT_MOVIE_PROVIDER_FANZA__VPNGATE_URL=http://admin:secret@127.0.0.1:8787/EJsW2EeBo9lY
+export MT_MOVIE_PROVIDER_FANZA__VPNGATE_USERNAME=admin
+export MT_MOVIE_PROVIDER_FANZA__VPNGATE_PASSWORD=secret
+export MT_MOVIE_PROVIDER_FANZA__PROXY=http://127.0.0.1:7928
+```
+
+The credentials may also be embedded in the URL, e.g.
+`MT_MOVIE_PROVIDER_FANZA__VPNGATE_URL=http://admin:secret@127.0.0.1:8787/EJsW2EeBo9lY`.
+
+### Fallback behavior
+
+When the exit IP turns out to be unusable, e.g. the VPN tunnel is down or the page is
+still region-restricted, the provider falls back as follows:
+
+1. The request is sent through the proxy.
+2. On failure, a new exit IP is acquired from the gateway and the request is retried once.
+3. If it still fails, the provider falls back to direct server egress, and probes the
+   proxy again after a cooldown.
+
+### Deployment notes
+
+- The gateway requires a Linux host with root privileges and a TUN device, i.e. it cannot
+  run on macOS or Windows.
+- Forward both the proxy port and the management port to the client, e.g.
+  `ssh -N -L 7928:127.0.0.1:7928 -L 8787:127.0.0.1:8787 root@VPS`.
+- The gateway must be configured with the target country, e.g. the routing mode
+  `fixed_region` with `force_country` set to `JP`, otherwise the exit IP may not be
+  located in the requested region.
+- Only the providers that are configured with a proxy are affected, all the other
+  providers keep using direct server egress.
 
 ## Credits
 

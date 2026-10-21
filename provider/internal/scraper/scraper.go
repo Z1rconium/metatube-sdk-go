@@ -1,6 +1,7 @@
 package scraper
 
 import (
+	"net/http"
 	"net/url"
 	"time"
 
@@ -79,7 +80,29 @@ func (s *Scraper) ParseActorIDFromURL(string) (string, error) { panic("unimpleme
 func (s *Scraper) ClonedCollector() *colly.Collector { return s.c.Clone() }
 
 // SetProxy sets http or socks5 proxy for HTTP requests.
-func (s *Scraper) SetProxy(proxyURL string) error { return s.c.SetProxy(proxyURL) }
+func (s *Scraper) SetProxy(proxyURL string) error {
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return err
+	}
+	s.SetProxyFunc(http.ProxyURL(u))
+	return nil
+}
+
+// SetProxyFunc sets a proxy function for HTTP requests.
+//
+// Unlike SetProxy, the given function is invoked for every request, which
+// makes it possible to switch the proxy at runtime, e.g. to rotate the exit
+// IP of a VPN gateway or to fall back to direct server egress.
+func (s *Scraper) SetProxyFunc(f func(*http.Request) (*url.URL, error)) {
+	transport := &http.Transport{Proxy: f, DisableKeepAlives: true}
+	if dt, ok := http.DefaultTransport.(*http.Transport); ok {
+		transport = dt.Clone()
+		transport.Proxy = f
+		transport.DisableKeepAlives = true
+	}
+	s.c.WithTransport(transport)
+}
 
 // SetRequestTimeout sets timeout for HTTP requests.
 func (s *Scraper) SetRequestTimeout(timeout time.Duration) { s.c.SetRequestTimeout(timeout) }

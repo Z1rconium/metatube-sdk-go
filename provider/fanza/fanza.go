@@ -2,9 +2,11 @@ package fanza
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -31,7 +33,9 @@ import (
 	"github.com/metatube-community/metatube-sdk-go/provider/fanza/internal/graphql"
 	"github.com/metatube-community/metatube-sdk-go/provider/fanza/internal/searchparse"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/imcmp"
+	"github.com/metatube-community/metatube-sdk-go/provider/internal/proxy"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/scraper"
+	"github.com/metatube-community/metatube-sdk-go/provider/internal/vpngate"
 )
 
 var (
@@ -62,6 +66,10 @@ const (
 
 const regionNotAvailable = "not-available-in-your-region"
 
+// defaultVPNGatewayProxy is the default proxy endpoint exposed by an
+// aimili-vpngate gateway.
+const defaultVPNGatewayProxy = "http://127.0.0.1:7928"
+
 var (
 	errContentIDNotFound = errors.New("content-id-not-found")
 	errRequireNewHandler = errors.New("require-new-handler")
@@ -73,6 +81,9 @@ type FANZA struct {
 	*scraper.Scraper
 	httpClient *http.Client
 	videoAPI   *graphql.Client
+	// proxy manages the outbound proxy of the provider, which is used to
+	// access the region-restricted pages through a foreign exit IP.
+	proxy *proxy.Manager
 }
 
 func New() *FANZA {
@@ -99,6 +110,70 @@ func (fz *FANZA) SetRequestTimeout(timeout time.Duration) {
 	fz.Scraper.SetRequestTimeout(timeout)
 }
 
+// SetProxy sets http or socks5 proxy for HTTP requests.
+//
+// The proxy is applied to both the scraper and the digital GraphQL API
+// client, so that all the requests are made through the same exit IP.
+func (fz *FANZA) SetProxy(proxyURL string) error {
+	m, err := proxy.New(proxyURL)
+	if err != nil {
+		return err
+	}
+	fz.proxy = m
+	fz.Scraper.SetProxyFunc(m.ProxyFunc)
+	// The GraphQL API client ignores the response status, so wrap the
+	// transport to surface the gateway errors of a dead VPN tunnel.
+	fz.httpClient.Transport = proxy.CheckStatus(m.Transport())
+	return nil
+}
+
+// SetConfig sets the additional configs for the FANZA provider.
+//
+// The following config keys are supported:
+//
+//   - proxy: the http or socks5 proxy endpoint, e.g. http://127.0.0.1:7928
+//   - vpngate_url: the base URL of an aimili-vpngate gateway management API,
+//     which includes the secret path, e.g. http://127.0.0.1:8787/EJsW2EeBo9lY
+//   - vpngate_username: the username of the gateway management backend
+//   - vpngate_password: the password of the gateway management backend
+//   - vpngate_country: the ISO country code of the exit IP, JP by default
+func (fz *FANZA) SetConfig(config provider.Config) error {
+	if !config.Has("vpngate_url") {
+		return nil
+	}
+	gatewayURL, err := config.GetString("vpngate_url")
+	if err != nil {
+		return err
+	}
+	gatewayConfig := vpngate.Config{
+		URL:     gatewayURL,
+		Country: vpngate.DefaultCountry,
+	}
+	if config.Has("vpngate_username") {
+		gatewayConfig.Username, _ = config.GetString("vpngate_username")
+	}
+	if config.Has("vpngate_password") {
+		gatewayConfig.Password, _ = config.GetString("vpngate_password")
+	}
+	if config.Has("vpngate_country") {
+		if v, err := config.GetString("vpngate_country"); err == nil && v != "" {
+			gatewayConfig.Country = strings.ToUpper(v)
+		}
+	}
+	gateway, err := vpngate.NewClient(gatewayConfig)
+	if err != nil {
+		return err
+	}
+	if fz.proxy == nil {
+		// No proxy configured, fall back to the default gateway proxy.
+		if err = fz.SetProxy(defaultVPNGatewayProxy); err != nil {
+			return err
+		}
+	}
+	fz.proxy.SetGateway(gateway, gatewayConfig.Country)
+	return nil
+}
+
 func (fz *FANZA) NormalizeMovieID(id string) string {
 	return strings.ToLower(id) /* FANZA uses lowercase ID */
 }
@@ -120,9 +195,17 @@ func (fz *FANZA) getHomepagesByID(id string) []string {
 }
 
 func (fz *FANZA) GetMovieInfoByID(id string) (info *model.MovieInfo, err error) {
+	err = fz.fetchWithExitFallback(func() (err error) {
+		info, err = fz.getMovieInfoByID(id)
+		return
+	})
+	return
+}
+
+func (fz *FANZA) getMovieInfoByID(id string) (info *model.MovieInfo, err error) {
 	var regionErr error
 	for _, homepage := range fz.getHomepagesByID(id) {
-		info, err = fz.GetMovieInfoByURL(homepage)
+		info, err = fz.getMovieInfoByURL(homepage)
 		if err == nil && info.IsValid() {
 			return
 		}
@@ -165,7 +248,15 @@ func (fz *FANZA) ParseMovieIDFromURL(rawURL string) (id string, err error) {
 	return
 }
 
-func (fz *FANZA) GetMovieInfoByURL(rawURL string) (*model.MovieInfo, error) {
+func (fz *FANZA) GetMovieInfoByURL(rawURL string) (info *model.MovieInfo, err error) {
+	err = fz.fetchWithExitFallback(func() (err error) {
+		info, err = fz.getMovieInfoByURL(rawURL)
+		return
+	})
+	return
+}
+
+func (fz *FANZA) getMovieInfoByURL(rawURL string) (info *model.MovieInfo, err error) {
 	if IsDigitalVideoURL(rawURL) {
 		return fz.getDigitalMovieInfoByURL(rawURL)
 	}
@@ -595,7 +686,15 @@ func (fz *FANZA) NormalizeMovieKeyword(keyword string) string {
 	return strings.ToLower(keyword) /* FANZA prefers lowercase */
 }
 
-func (fz *FANZA) SearchMovie(keyword string) ([]*model.MovieSearchResult, error) {
+func (fz *FANZA) SearchMovie(keyword string) (results []*model.MovieSearchResult, err error) {
+	err = fz.fetchWithExitFallback(func() (err error) {
+		results, err = fz.doSearchMovie(keyword)
+		return
+	})
+	return
+}
+
+func (fz *FANZA) doSearchMovie(keyword string) (results []*model.MovieSearchResult, err error) {
 	if strings.Contains(keyword, "-") {
 		results, err := fz.searchMovieNext(strings.Replace(keyword,
 			/* FANZA cannot search hyphened number */
@@ -758,15 +857,78 @@ func (fz *FANZA) sortMovieSearchResults(keyword string, results []*model.MovieSe
 }
 
 func (fz *FANZA) GetMovieReviewsByID(id string) (reviews []*model.MovieReviewDetail, err error) {
+	err = fz.fetchWithExitFallback(func() (err error) {
+		reviews, err = fz.getMovieReviewsByID(id)
+		return
+	})
+	return
+}
+
+func (fz *FANZA) getMovieReviewsByID(id string) (reviews []*model.MovieReviewDetail, err error) {
 	for _, homepage := range fz.getHomepagesByID(id) {
-		if reviews, err = fz.GetMovieReviewsByURL(homepage); err == nil && len(reviews) > 0 {
+		if reviews, err = fz.getMovieReviewsByURL(homepage); err == nil && len(reviews) > 0 {
 			return
 		}
 	}
 	return nil, provider.ErrInfoNotFound
 }
 
+// fetchWithExitFallback performs the given fetch function and, when the
+// current exit IP turns out to be unusable, e.g. the VPN tunnel is down or
+// the page is still region-restricted, it tries to acquire a new exit IP once
+// before falling back to direct server egress.
+//
+// It is a no-op if no proxy is configured for the provider.
+func (fz *FANZA) fetchWithExitFallback(fetch func() error) error {
+	err := fetch()
+	if err == nil || !fz.isExitUnusable(err) {
+		return err
+	}
+	if fz.proxy == nil {
+		return err // no proxy configured, nothing to fall back from.
+	}
+	// The current exit IP is unusable, try to acquire a new one.
+	if fz.proxy.CanRotate() {
+		log.Printf("[FANZA] exit IP is unusable, acquiring a new one: %v", err)
+		if rErr := fz.proxy.Rotate(context.Background()); rErr != nil {
+			log.Printf("[FANZA] failed to acquire a new exit IP: %v", rErr)
+		} else {
+			err = fetch()
+			if err == nil || !fz.isExitUnusable(err) {
+				return err
+			}
+		}
+	}
+	// The exit IP is still unusable, fall back to direct server egress.
+	log.Printf("[FANZA] falling back to direct server egress")
+	fz.proxy.Fallback()
+	return fetch()
+}
+
+// isExitUnusable reports whether the given error indicates that the current
+// exit IP cannot be used to access the provider.
+func (fz *FANZA) isExitUnusable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrRegionNotAvailable) {
+		return true
+	}
+	if errors.Is(err, errRequireNewHandler) {
+		return false // the request is fine, it just needs another handler.
+	}
+	return proxy.IsTransportError(err)
+}
+
 func (fz *FANZA) GetMovieReviewsByURL(rawURL string) (reviews []*model.MovieReviewDetail, err error) {
+	err = fz.fetchWithExitFallback(func() (err error) {
+		reviews, err = fz.getMovieReviewsByURL(rawURL)
+		return
+	})
+	return
+}
+
+func (fz *FANZA) getMovieReviewsByURL(rawURL string) (reviews []*model.MovieReviewDetail, err error) {
 	if IsDigitalVideoURL(rawURL) {
 		return fz.getDigitalMovieReviewsByURL(rawURL)
 	}

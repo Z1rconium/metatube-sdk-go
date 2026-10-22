@@ -97,6 +97,11 @@ still region-restricted, the provider falls back as follows:
    back again. The default server egress is the proxy that you have configured for the
    server, e.g. `HTTP_PROXY` / `HTTPS_PROXY`, or direct egress if there is none.
 
+FANZA links on `video.dmm.co.jp` are recognized alongside the legacy store URLs.
+A redirect to `sorry.dmm.co.jp` is reported as HTTP 503 with the message
+`FANZA is temporarily under maintenance`; it does not rotate the exit IP or switch
+proxies. ID lookups still try the existing alternative pages for the same content ID.
+
 ### Deployment notes
 
 - The gateway requires a Linux host with root privileges and a TUN device, i.e. it cannot

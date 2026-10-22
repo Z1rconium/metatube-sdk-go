@@ -129,6 +129,11 @@ func (e *Engine) GetMovieProviderByURL(rawURL string) (mt.MovieProvider, error) 
 			return p, nil
 		}
 	}
+	for _, p := range e.movieProviders.Iterator() {
+		if matcher, ok := p.(mt.URLMatcher); ok && matcher.MatchURL(u) {
+			return p, nil
+		}
+	}
 	return nil, mt.ErrProviderNotFound
 }
 

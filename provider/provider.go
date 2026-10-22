@@ -27,6 +27,12 @@ type Provider interface {
 	URL() *url.URL
 }
 
+// URLMatcher optionally recognizes additional URLs beyond a provider's base URL.
+// The engine only consults matchers belonging to enabled providers.
+type URLMatcher interface {
+	MatchURL(*url.URL) bool
+}
+
 type MovieSearcher interface {
 	// SearchMovie searches matched movies.
 	SearchMovie(keyword string) ([]*model.MovieSearchResult, error)

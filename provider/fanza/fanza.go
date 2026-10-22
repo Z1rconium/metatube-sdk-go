@@ -28,6 +28,7 @@ import (
 	"github.com/metatube-community/metatube-sdk-go/common/js"
 	"github.com/metatube-community/metatube-sdk-go/common/number"
 	"github.com/metatube-community/metatube-sdk-go/common/parser"
+	mterrors "github.com/metatube-community/metatube-sdk-go/errors"
 	"github.com/metatube-community/metatube-sdk-go/model"
 	"github.com/metatube-community/metatube-sdk-go/provider"
 	"github.com/metatube-community/metatube-sdk-go/provider/fanza/internal/graphql"
@@ -42,6 +43,7 @@ var (
 	_ provider.MovieProvider = (*FANZA)(nil)
 	_ provider.MovieSearcher = (*FANZA)(nil)
 	_ provider.MovieReviewer = (*FANZA)(nil)
+	_ provider.URLMatcher    = (*FANZA)(nil)
 )
 
 const (
@@ -75,6 +77,9 @@ var (
 	errRequireNewHandler = errors.New("require-new-handler")
 
 	ErrRegionNotAvailable = errors.New(regionNotAvailable)
+
+	// ErrMaintenance reports a source outage that changing exit IP cannot fix.
+	ErrMaintenance = mterrors.New(http.StatusServiceUnavailable, "FANZA is temporarily under maintenance")
 )
 
 type FANZA struct {
@@ -218,8 +223,14 @@ func (fz *FANZA) GetMovieInfoByID(id string) (info *model.MovieInfo, err error) 
 }
 
 func (fz *FANZA) getMovieInfoByID(id string) (info *model.MovieInfo, err error) {
+	var maintenanceErr error
 	for _, homepage := range fz.getHomepagesByID(id) {
-		if info, err = fz.getMovieInfoByURL(homepage); errors.Is(err, ErrRegionNotAvailable) || err == nil && info.IsValid() {
+		info, err = fz.getMovieInfoByURL(homepage)
+		if errors.Is(err, ErrMaintenance) {
+			maintenanceErr = err
+			continue
+		}
+		if errors.Is(err, ErrRegionNotAvailable) || err == nil && info.IsValid() {
 			return
 		}
 		// A dead tunnel would fail the remaining homepages the same way, so
@@ -227,11 +238,9 @@ func (fz *FANZA) getMovieInfoByID(id string) (info *model.MovieInfo, err error) 
 		if fz.isExitUnusable(err) {
 			break
 		}
-		// A dead tunnel would fail the remaining homepages the same way, so
-		// let the caller rotate the exit IP or fall back at once.
-		if fz.isExitUnusable(err) {
-			break
-		}
+	}
+	if maintenanceErr != nil && !fz.isExitUnusable(err) {
+		return nil, maintenanceErr
 	}
 	if err != nil && err.Error() == http.StatusText(http.StatusNotFound) {
 		err = provider.ErrInfoNotFound
@@ -860,8 +869,13 @@ func (fz *FANZA) GetMovieReviewsByID(id string) (reviews []*model.MovieReviewDet
 }
 
 func (fz *FANZA) getMovieReviewsByID(id string) (reviews []*model.MovieReviewDetail, err error) {
+	var maintenanceErr error
 	for _, homepage := range fz.getHomepagesByID(id) {
 		reviews, err = fz.getMovieReviewsByURL(homepage)
+		if errors.Is(err, ErrMaintenance) {
+			maintenanceErr = err
+			continue
+		}
 		if err == nil && len(reviews) > 0 {
 			return
 		}
@@ -873,6 +887,9 @@ func (fz *FANZA) getMovieReviewsByID(id string) (reviews []*model.MovieReviewDet
 	}
 	if fz.isExitUnusable(err) {
 		return nil, err // the exit IP is unusable, do not hide it.
+	}
+	if maintenanceErr != nil {
+		return nil, maintenanceErr
 	}
 	return nil, provider.ErrInfoNotFound
 }
@@ -920,7 +937,7 @@ func (fz *FANZA) fetchWithExitFallback(fetch func() error) error {
 // isExitUnusable reports whether the given error indicates that the current
 // exit IP cannot be used to access the provider.
 func (fz *FANZA) isExitUnusable(err error) bool {
-	if err == nil {
+	if err == nil || errors.Is(err, ErrMaintenance) {
 		return false
 	}
 	if errors.Is(err, ErrRegionNotAvailable) {
@@ -1175,6 +1192,9 @@ func (fz *FANZA) parseVRPreviewVideoURL(vrVideoURL string) (previewVideoURL stri
 }
 
 func (fz *FANZA) digitalRedirectFunc(req *http.Request, _ []*http.Request) error {
+	if strings.EqualFold(req.URL.Hostname(), "sorry.dmm.co.jp") {
+		return ErrMaintenance
+	}
 	if strings.HasPrefix(req.URL.String(), videoURL) {
 		if !strings.HasSuffix(req.URL.Path, "/") {
 			// ensure trailing slash.
@@ -1189,8 +1209,23 @@ func (fz *FANZA) digitalRedirectFunc(req *http.Request, _ []*http.Request) error
 	return nil
 }
 
-func IsDigitalVideoURL(url string) bool {
-	return strings.HasPrefix(url, videoURL)
+// MatchURL recognizes the digital content URLs hosted separately from the store.
+func (fz *FANZA) MatchURL(u *url.URL) bool {
+	if u == nil || (u.Scheme != "https" && u.Scheme != "http") ||
+		!strings.EqualFold(u.Hostname(), "video.dmm.co.jp") || u.Query().Get("id") == "" {
+		return false
+	}
+	switch strings.TrimSuffix(u.Path, "/") {
+	case "/av/content", "/amateur/content", "/anime/content", "/cinema/content":
+		return true
+	default:
+		return false
+	}
+}
+
+func IsDigitalVideoURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && strings.EqualFold(u.Hostname(), "video.dmm.co.jp")
 }
 
 // ParseNumber parses FANZA-formatted id to general ID.
